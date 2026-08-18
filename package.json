@@ -1,0 +1,17 @@
+{
+  "name": "ninja-copilot",
+  "version": "0.1.0",
+  "description": "Chrome extension assisting cloud operations support with repetitive browser tasks.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "esbuild": "^0.21.5",
+    "typescript": "^5.5.4"
+  }
+}

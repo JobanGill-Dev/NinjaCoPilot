@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "NinjaCoPilot",
+  "version": "0.1.0",
+  "description": "Assists cloud operations support with repetitive browser tasks. Feature 1: fetch the machine's public IP and fill it into a matched form (e.g. Azure Key Vault firewall).",
+  "action": {
+    "default_title": "NinjaCoPilot",
+    "default_popup": "popup/popup.html"
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://api.ipify.org/*",
+    "https://api64.ipify.org/*",
+    "https://ipv4.icanhazip.com/*"
+  ]
+}

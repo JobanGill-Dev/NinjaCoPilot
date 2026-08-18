@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="popup.css" />
+    <title>NinjaCoPilot</title>
+  </head>
+  <body>
+    <header class="header">
+      <span class="logo">🥷</span>
+      <div>
+        <h1 class="title">NinjaCoPilot</h1>
+        <p class="subtitle">Cloud Ops helper</p>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="card">
+        <div class="row">
+          <span class="label">Public IP</span>
+          <span id="ip" class="value">Detecting…</span>
+        </div>
+        <div class="row">
+          <span class="label">This page</span>
+          <span id="page-status" class="value muted">Checking…</span>
+        </div>
+      </section>
+
+      <button id="fill-btn" class="primary" disabled>Fill Public IP</button>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
