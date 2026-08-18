@@ -7,10 +7,10 @@ import { AppError, toAppErrorData } from '../core/errors';
 import { rootLogger, type Logger } from '../core/logger';
 import { sendToBackground } from '../core/messaging';
 import { err } from '../core/result';
-import { matchRule, type FillRule } from '../features/publicIp/rules';
+import { matchRule, type AzureGridStrategy, type FillRule } from '../features/publicIp/rules';
 import { runFillFlow } from './flow/runFillFlow';
 import { readGrid } from './gridReader';
-import { PageBanner } from './ui/banner';
+import { popups, type PopupHandle } from './ui/popup';
 import type { ContentRequest, ContentResponse } from '../shared/types/messages';
 
 declare global {
@@ -20,6 +20,21 @@ declare global {
 }
 
 const log = rootLogger.child('content');
+
+// Blade detection is event-driven; these bound the small amount of DOM work.
+const URL_HEARTBEAT_MS = 2000; // fallback for pushState navigations (href compare only)
+const BLADE_POLL_MS = 800; // how often to look for the blade after a URL change
+const BLADE_POLL_TIMEOUT_MS = 30000; // give up waiting for the blade after this
+const EVALUATE_DEBOUNCE_MS = 300; // coalesce grid mutations before re-reading
+
+/** True while the extension context is alive; never throws (torn-down contexts). */
+function contextAlive(): boolean {
+  try {
+    return !!chrome.runtime?.id;
+  } catch {
+    return false;
+  }
+}
 
 /** Handles the extension-icon path: popup -> background -> here. */
 function registerMessageListener(): void {
@@ -45,103 +60,168 @@ function registerMessageListener(): void {
 }
 
 /**
- * Polls the page while a rule matches and the target blade is ready, then shows
- * a banner offering to add the public IP (unless it is already present).
+ * Detects the Key Vault firewall blade and offers to add the public IP.
+ *
+ * Instead of polling the DOM continuously, it reacts to SPA navigation events
+ * and only does DOM work when relevant: after a URL change it briefly waits for
+ * the blade to render, then watches just the grid (scoped, debounced) so the
+ * banner updates when the IP list changes — keeping idle cost near zero.
  */
 class BannerController {
-  private readonly banner = new PageBanner();
   private busy = false;
+  private offerHandle: PopupHandle | null = null;
+  private offerKey: string | null = null;
   private ipCache: { value: string; at: number } | null = null;
   private readonly dismissed = new Set<string>();
   private lastLogKey = '';
-  private timer: ReturnType<typeof setInterval> | null = null;
+
+  private lastUrl = '';
+  private urlTimer: ReturnType<typeof setInterval> | null = null;
+  private bladeTimer: ReturnType<typeof setInterval> | null = null;
+  private bladeDeadline = 0;
+  private gridObserver: MutationObserver | null = null;
+  private evaluateTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private readonly log: Logger) {}
 
   start(): void {
-    void this.safeTick();
-    this.timer = setInterval(() => void this.safeTick(), 1500);
+    const onChange = (): void => this.onLocationChange();
+    window.addEventListener('hashchange', onChange);
+    window.addEventListener('popstate', onChange);
+    // Cheap fallback for pushState navigations that don't touch the hash: a bare
+    // string compare, no DOM access.
+    this.urlTimer = setInterval(() => {
+      if (!contextAlive()) return this.teardown();
+      if (location.href !== this.lastUrl) this.onLocationChange();
+    }, URL_HEARTBEAT_MS);
+    this.onLocationChange();
   }
 
-  /** Runs a tick, stopping cleanly if the extension context is gone and never throwing. */
-  private async safeTick(): Promise<void> {
-    // After an extension reload the old content script lingers with an
-    // invalidated context; chrome.runtime.id becomes undefined. Stop polling.
-    if (!chrome.runtime?.id) {
-      if (this.timer !== null) {
-        clearInterval(this.timer);
-        this.timer = null;
-      }
-      return;
-    }
-    try {
-      await this.tick();
-    } catch (cause) {
-      this.logOnce('tickfail', `Banner check failed: ${String(cause)}`);
-    }
-  }
-
-  private async tick(): Promise<void> {
-    if (this.busy) return;
+  private onLocationChange(): void {
+    if (!contextAlive()) return this.teardown();
+    this.lastUrl = location.href;
+    this.stopBladePoll();
+    this.disconnectGridObserver();
 
     const rule = matchRule(location.href);
     if (!rule || rule.strategy.kind !== 'azure-grid') {
-      this.banner.hide();
+      this.dismissOffer();
       return;
     }
-
-    const { existingTableSelector, addButtonSelector } = rule.strategy;
-    const addButton = document.querySelector(addButtonSelector);
-    if (!addButton) {
-      // Not on the Networking/Firewall blade yet; wait quietly.
-      this.banner.hide();
-      return;
-    }
-
-    const ip = await this.getIp();
-    if (!ip) return;
-
-    const value = (rule.transform ?? ((x: string) => x))(ip);
-    const key = `${location.href}|${value}`;
-
-    // The list container is absent when there are no existing entries.
-    const snapshot = readGrid(existingTableSelector);
-    if (snapshot.ips.includes(value)) {
-      this.logOnce(`present:${key}`, `Public IP ${value} is already in the firewall list`);
-      this.banner.hide();
-      return;
-    }
-    if (this.dismissed.has(key)) {
-      this.banner.hide();
-      return;
-    }
-
-    this.logOnce(`offer:${key}`, `Offering to add public IP ${value}`);
-    this.banner.show(value, {
-      onFill: () => void this.onFill(rule, key),
-      onClose: () => {
-        this.dismissed.add(key);
-        this.banner.hide();
-      },
-    });
+    this.startBladePoll();
   }
 
-  private async onFill(rule: FillRule, key: string): Promise<void> {
+  /** Briefly waits for the firewall blade's Add button to render, then settles. */
+  private startBladePoll(): void {
+    this.bladeDeadline = Date.now() + BLADE_POLL_TIMEOUT_MS;
+    const tick = (): void => {
+      if (!contextAlive()) return this.teardown();
+      const rule = matchRule(location.href);
+      if (!rule || rule.strategy.kind !== 'azure-grid') {
+        this.stopBladePoll();
+        this.dismissOffer();
+        return;
+      }
+      if (document.querySelector(rule.strategy.addButtonSelector)) {
+        this.stopBladePoll();
+        this.attachGridObserver(rule.strategy);
+        this.scheduleEvaluate();
+      } else if (Date.now() >= this.bladeDeadline) {
+        this.stopBladePoll();
+        this.dismissOffer();
+      }
+    };
+    this.bladeTimer = setInterval(tick, BLADE_POLL_MS);
+    tick();
+  }
+
+  /** Observes only the grid area so evaluate() runs when the IP list changes. */
+  private attachGridObserver(strategy: AzureGridStrategy): void {
+    const target =
+      document.querySelector(strategy.existingTableSelector) ??
+      document.querySelector(strategy.addButtonSelector)?.parentElement ??
+      document.body;
+    this.gridObserver = new MutationObserver(() => this.scheduleEvaluate());
+    this.gridObserver.observe(target, { childList: true, subtree: true, characterData: true });
+  }
+
+  private scheduleEvaluate(): void {
+    if (this.evaluateTimer !== null) clearTimeout(this.evaluateTimer);
+    this.evaluateTimer = setTimeout(() => {
+      this.evaluateTimer = null;
+      void this.evaluate();
+    }, EVALUATE_DEBOUNCE_MS);
+  }
+
+  private async evaluate(): Promise<void> {
+    if (this.busy || !contextAlive()) return;
+    try {
+      const rule = matchRule(location.href);
+      if (!rule || rule.strategy.kind !== 'azure-grid') {
+        this.dismissOffer();
+        return;
+      }
+      const { existingTableSelector, addButtonSelector } = rule.strategy;
+      if (!document.querySelector(addButtonSelector)) {
+        this.dismissOffer();
+        return;
+      }
+
+      const ip = await this.getIp();
+      if (!ip) return;
+
+      const value = (rule.transform ?? ((x: string) => x))(ip);
+      const key = `${location.href}|${value}`;
+
+      const snapshot = readGrid(existingTableSelector);
+      if (snapshot.ips.includes(value)) {
+        this.logOnce(`present:${key}`, `Public IP ${value} is already in the firewall list`);
+        this.dismissOffer();
+        return;
+      }
+      if (this.dismissed.has(key)) {
+        this.dismissOffer();
+        return;
+      }
+      // Already offering for this exact page+IP; leave the existing card as-is.
+      if (this.offerKey === key && this.offerHandle) return;
+
+      this.dismissOffer();
+      this.logOnce(`offer:${key}`, `Offering to add public IP ${value}`);
+      const handle = popups.show({
+        message: 'Your public IP is not in this Key Vault firewall.',
+        highlight: value,
+        action: { label: 'Add my public IP', onClick: () => void this.onFill(rule, key, handle) },
+        onClose: () => {
+          this.dismissed.add(key);
+          this.clearOfferRef(handle);
+        },
+      });
+      this.offerHandle = handle;
+      this.offerKey = key;
+    } catch (cause) {
+      if (!contextAlive()) return this.teardown();
+      this.logOnce('evalfail', `Banner check failed: ${String(cause)}`);
+    }
+  }
+
+  private async onFill(rule: FillRule, key: string, handle: PopupHandle): Promise<void> {
     this.busy = true;
-    this.banner.setBusy('Adding your public IP…');
+    handle.setBusy('Adding your public IP…');
     try {
       const result = await runFillFlow(rule, this.log);
       if (result.ok) {
         const done = result.value.status === 'already-present';
-        this.banner.setSuccess(done ? `${result.value.value} already added` : `Added ${result.value.value}`);
+        handle.setSuccess(done ? `${result.value.value} already added` : `Added ${result.value.value}`);
         this.dismissed.add(key);
-        setTimeout(() => this.banner.hide(), 4000);
+        this.clearOfferRef(handle);
+        setTimeout(() => handle.close(), 4000);
       } else {
-        this.banner.setError(result.error.message);
+        handle.setError(result.error.message);
       }
     } catch (cause) {
       this.log.error('Fill flow threw', cause);
-      this.banner.setError('Could not reach the extension. Try reloading the page.');
+      handle.setError('Could not reach the extension. Try reloading the page.');
     } finally {
       this.busy = false;
     }
@@ -163,7 +243,50 @@ class BannerController {
     }
   }
 
-  /** Logs a message only when the state key changes, to avoid poll spam. */
+  private stopBladePoll(): void {
+    if (this.bladeTimer !== null) {
+      clearInterval(this.bladeTimer);
+      this.bladeTimer = null;
+    }
+  }
+
+  private disconnectGridObserver(): void {
+    if (this.gridObserver) {
+      this.gridObserver.disconnect();
+      this.gridObserver = null;
+    }
+  }
+
+  private teardown(): void {
+    if (this.urlTimer !== null) {
+      clearInterval(this.urlTimer);
+      this.urlTimer = null;
+    }
+    this.stopBladePoll();
+    this.disconnectGridObserver();
+    if (this.evaluateTimer !== null) {
+      clearTimeout(this.evaluateTimer);
+      this.evaluateTimer = null;
+    }
+    this.dismissOffer();
+  }
+
+  /** Programmatically removes the current offer popup (no user-dismiss). */
+  private dismissOffer(): void {
+    this.offerHandle?.close();
+    this.offerHandle = null;
+    this.offerKey = null;
+  }
+
+  /** Clears our reference if it still points at the given handle. */
+  private clearOfferRef(handle: PopupHandle): void {
+    if (this.offerHandle === handle) {
+      this.offerHandle = null;
+      this.offerKey = null;
+    }
+  }
+
+  /** Logs a message only when the state key changes, to avoid spam. */
   private logOnce(key: string, message: string): void {
     if (this.lastLogKey === key) return;
     this.lastLogKey = key;
