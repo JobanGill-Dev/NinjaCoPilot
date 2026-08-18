@@ -15,13 +15,7 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "verbatimModuleSyntax": false,
-    "baseUrl": ".",
-    "paths": {
-      "@core/*": ["src/core/*"],
-      "@features/*": ["src/features/*"],
-      "@shared/*": ["src/shared/*"]
-    }
+    "verbatimModuleSyntax": false
   },
   "include": ["src"]
 }
