@@ -45,9 +45,6 @@ async function handleGetPublicIp(): Promise<Result<PublicIpResult>> {
 }
 
 async function handleFillActiveTab(): Promise<Result<FillResult>> {
-  const ipResult = await getPublicIp();
-  if (!ipResult.ok) return ipResult;
-
   const tab = await getActiveTab();
   if (!tab?.id) {
     return err(toAppErrorData(new AppError('NO_ACTIVE_TAB', 'No active tab was found.')));
@@ -55,15 +52,17 @@ async function handleFillActiveTab(): Promise<Result<FillResult>> {
 
   const rule = matchRule(tab.url);
   if (!rule) {
+    log.info('No rule matched for URL', tab.url);
     return err(
       toAppErrorData(
         new AppError('NO_MATCHING_RULE', 'This page has no configured form to fill.', tab.url),
       ),
     );
   }
+  log.info('URL matched rule', { ruleId: rule.id, ruleName: rule.name, url: tab.url });
 
-  const value = (rule.transform ?? ((ip: string) => ip))(ipResult.value.ip);
-
+  // Ensure the content script is present (idempotent thanks to its guard), then
+  // let it run the strategy flow and report the outcome.
   try {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -74,15 +73,15 @@ async function handleFillActiveTab(): Promise<Result<FillResult>> {
     return err(toAppErrorData(new AppError('INJECTION_FAILED', 'Could not access this page.', cause)));
   }
 
-  const fillResult = await sendToTab(tab.id, { type: 'FILL_FIELD', payload: { selectors: rule.selectors, value } });
-  if (!fillResult.ok) return fillResult;
+  const outcome = await sendToTab(tab.id, { type: 'RUN_FILL_FLOW' });
+  if (!outcome.ok) return outcome;
 
-  log.info('Fill complete', { rule: rule.id, selector: fillResult.value.matchedSelector });
+  log.info('Flow complete', { rule: rule.id, status: outcome.value.status });
   return ok({
+    status: outcome.value.status,
     ruleId: rule.id,
     ruleName: rule.name,
-    matchedSelector: fillResult.value.matchedSelector,
-    value,
+    value: outcome.value.value,
   });
 }
 

@@ -39,11 +39,13 @@ async function loadPageStatus(): Promise<void> {
   const rule = matchRule(tab?.url);
 
   if (rule) {
+    log.info(`URL matched rule "${rule.name}"`, tab?.url);
     pageStatusEl.textContent = rule.name;
     pageStatusEl.classList.remove('muted');
     pageStatusEl.classList.add('match');
     fillBtn.disabled = false;
   } else {
+    log.info('No rule matched for this page', tab?.url);
     pageStatusEl.textContent = 'No configured form';
     fillBtn.disabled = true;
   }
@@ -56,7 +58,12 @@ async function onFillClick(): Promise<void> {
   try {
     const result = await sendToBackground({ type: 'FILL_ACTIVE_TAB' });
     if (result.ok) {
-      setStatus(`Filled ${result.value.value} into ${result.value.ruleName}.`, 'ok');
+      const r = result.value;
+      if (r.status === 'already-present') {
+        setStatus(`${r.value} is already in the firewall list.`, 'ok');
+      } else {
+        setStatus(`Added ${r.value} to ${r.ruleName}.`, 'ok');
+      }
     } else {
       setStatus(result.error.message, 'error');
     }

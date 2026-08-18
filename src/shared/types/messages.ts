@@ -12,10 +12,13 @@ export interface PublicIpResult {
   cached: boolean;
 }
 
+/** Whether the IP was newly added or was already present. */
+export type FillStatus = 'filled' | 'already-present';
+
 export interface FillResult {
+  status: FillStatus;
   ruleId: string;
   ruleName: string;
-  matchedSelector: string;
   value: string;
 }
 
@@ -26,14 +29,11 @@ export interface BackgroundResponseMap {
 }
 
 /** Messages the background worker sends into an injected content script. */
-export type ContentRequest = {
-  type: 'FILL_FIELD';
-  payload: { selectors: string[]; value: string };
-};
+export type ContentRequest = { type: 'RUN_FILL_FLOW' };
 
-export interface FieldFillOutcome {
-  matchedSelector: string;
+export interface FlowOutcome {
+  status: FillStatus;
   value: string;
 }
 
-export type ContentResponse = Result<FieldFillOutcome>;
+export type ContentResponse = Result<FlowOutcome>;

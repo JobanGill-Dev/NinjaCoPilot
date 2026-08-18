@@ -1,16 +1,40 @@
 // Configuration for the "fill public IP" feature. Each rule maps a URL pattern
-// to the form field(s) that should receive the value. Add new rules here to
-// support additional sites/tools without touching the core logic.
+// to a strategy describing how to place the IP on that page. Add new rules here
+// to support additional sites/tools without touching the flow logic.
+
+/** Fills a single input located by CSS selector (simple forms). */
+export interface SingleFieldStrategy {
+  kind: 'single-field';
+  selectors: string[];
+}
+
+/**
+ * Azure-style editable grid: check an existing-IP table, click an "add" button
+ * to spawn a new row, fill it, then click an "apply" button to commit.
+ */
+export interface AzureGridStrategy {
+  kind: 'azure-grid';
+  /** Container holding the list of already-added IPs. */
+  existingTableSelector: string;
+  /** Button that adds a new client-IP row. */
+  addButtonSelector: string;
+  /** Button that commits the change. */
+  applyButtonSelector: string;
+  /** Candidate selectors for the freshly added, empty input row. */
+  newFieldSelectors: string[];
+}
+
+export type FillStrategy = SingleFieldStrategy | AzureGridStrategy;
 
 export interface FillRule {
   /** Stable identifier used in logs and messages. */
   id: string;
-  /** Human-friendly name shown in the popup. */
+  /** Human-friendly name shown in the popup / banner. */
   name: string;
   /** Regex matched against the full tab URL (including hash for SPA routes). */
   urlPattern: RegExp;
-  /** Ordered CSS selectors; the first field found on the page is used. */
-  selectors: string[];
+  /** How to place the IP on the matched page. */
+  strategy: FillStrategy;
   /** Optional transform applied to the IP before filling (e.g. append CIDR). */
   transform?: (ip: string) => string;
   description?: string;
@@ -20,20 +44,21 @@ export const FILL_RULES: FillRule[] = [
   {
     id: 'azure-kv-firewall',
     name: 'Azure Key Vault — Firewall',
-    // Azure Portal is a SPA; the Key Vault networking blade is addressed via the
-    // URL hash. Matches portal.azure.com pages referencing a Key Vault resource.
-    urlPattern: /https:\/\/portal\.azure\.com\/.*(Microsoft\.KeyVault|KeyVault|keyvault).*(networking|firewall|Networking)?/i,
-    // NOTE: Azure uses Fluent UI with dynamic markup. These selectors are best
-    // guesses and should be verified/adjusted against the live blade.
-    selectors: [
-      'input[aria-label="Address range"]',
-      'input[placeholder="IP address or CIDR, e.g. 168.63.129.16 or 168.63.129.0/24"]',
-      'input[aria-label*="IP address" i]',
-      'input[placeholder*="CIDR" i]',
-    ],
+    // Azure Portal is a SPA; Key Vault blades are addressed via the URL hash.
+    // The DOM readiness check (table + add button) narrows this to the actual
+    // Networking/Firewall blade, so the URL match can stay broad.
+    urlPattern: /https:\/\/portal\.azure\.com\/.*(Microsoft\.KeyVault|KeyVault|keyvault)/i,
+    strategy: {
+      kind: 'azure-grid',
+      existingTableSelector: '.fxc-gc-content',
+      addButtonSelector: `[aria-label="Add your client IP address (e.g: '10.0.0.0')"]`,
+      applyButtonSelector: `[title="Apply"]`,
+      // The freshly added row's editable input.
+      newFieldSelectors: [`[aria-label="IP address or CIDR"]`],
+    },
     // Firewall entries accept a single IP; use "/32" if a CIDR is required.
     transform: (ip) => ip,
-    description: 'Fills your public IP into the Key Vault firewall address field.',
+    description: 'Adds your public IP to the Key Vault firewall allow-list.',
   },
 ];
 
